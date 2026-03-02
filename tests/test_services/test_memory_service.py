@@ -78,20 +78,22 @@ class TestTruncateContent:
     def test_long_content_truncated(self):
         """Content exceeding limit should be truncated with marker."""
         content = "A" * 500 + "B" * 500
-        result = memory_service._truncate_content(content, 200)
+        result = memory_service._truncate_content(content, 200, "test.md")
         assert len(result) < len(content)
-        assert "[content truncated]" in result
+        assert "truncated" in result
+        assert "test.md" in result
         assert result.startswith("A")
         assert result.endswith("B")
 
     def test_head_tail_ratio(self):
         """Truncation preserves 70% head and 20% tail."""
         content = "H" * 700 + "T" * 300
-        result = memory_service._truncate_content(content, 100)
-        # Marker includes surrounding newlines
+        result = memory_service._truncate_content(content, 100, "test.md")
+        # Marker includes filename and char counts
         assert "H" * 70 in result
         assert result.endswith("T" * 20)
-        assert "[content truncated]" in result
+        assert "truncated test.md" in result
+        assert "kept 70+20 of 1000 chars" in result
 
 
 class TestBootstrapPath:
@@ -215,7 +217,7 @@ class TestLoadBootstrapFiles:
             memory_service.write_bootstrap_file("global", "SOUL.md", big_content)
             result = memory_service.load_bootstrap_files()
             assert len(result["SOUL.md"]) < len(big_content)
-            assert "[content truncated]" in result["SOUL.md"]
+            assert "truncated SOUL.md" in result["SOUL.md"]
 
     def test_total_limit(self, tmp_path: Path):
         """Total content across files should not exceed TOTAL_CHAR_LIMIT."""
@@ -415,177 +417,155 @@ class TestKeywordSearch:
                 assert len(results) >= 1
 
 
-# ─── Flush Memory Tests ──────────────────────────────────────
+# ─── New Memory Helper Tests ─────────────────────────────────
 
 
-class TestFlushMemory:
-    """Tests for flush_memory() — LLM extraction and dedup logic."""
+class TestListMemoryFiles:
+    """Tests for list_memory_files()."""
 
-    @pytest.mark.asyncio
-    async def test_empty_messages_returns_zero(self):
-        """Flush with no messages should return 0 immediately."""
-        count = await memory_service.flush_memory(messages=[])
-        assert count == 0
+    def test_no_files(self, tmp_path: Path):
+        """When no files exist, should return '(no files yet)'."""
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.list_memory_files("test-agent")
+            assert result == "(no files yet)"
 
-    @pytest.mark.asyncio
-    async def test_empty_content_messages_returns_zero(self):
-        """Flush with messages that have no text content should return 0."""
-        count = await memory_service.flush_memory(messages=[{"role": "user", "content": ""}])
-        assert count == 0
+    def test_with_bootstrap_files(self, tmp_path: Path):
+        """Should list existing bootstrap files with sizes."""
+        agent_dir = tmp_path / "agents" / "test-agent"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "SOUL.md").write_text("I am an agent", encoding="utf-8")
+        (agent_dir / "USER.md").write_text("User info", encoding="utf-8")
 
-    @pytest.mark.asyncio
-    async def test_llm_parse_and_save(self):
-        """Flush should parse LLM response and save entries."""
-        # Mock LLM response
-        mock_response = MagicMock()
-        mock_block = MagicMock()
-        mock_block.text = '[{"content": "User likes Python", "category": "preference"}]'
-        mock_response.content = [mock_block]
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.list_memory_files("test-agent")
+            assert "SOUL.md" in result
+            assert "USER.md" in result
+            assert "MEMORY.md" not in result  # doesn't exist
+            assert "13 bytes" in result  # "I am an agent" is 13 bytes (ASCII)
 
-        mock_llm = AsyncMock()
-        mock_llm.acreate = AsyncMock(return_value=mock_response)
+    def test_with_daily_logs(self, tmp_path: Path):
+        """Should list recent daily memory logs."""
+        agent_dir = tmp_path / "agents" / "test-agent"
+        memory_dir = agent_dir / "memory"
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "2026-03-01.md").write_text("Day 1 notes", encoding="utf-8")
+        (memory_dir / "2026-03-02.md").write_text("Day 2 notes", encoding="utf-8")
 
-        mock_create = AsyncMock(return_value={"id": "new-id", "content": "User likes Python"})
-        mock_search = AsyncMock(return_value=[])
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.list_memory_files("test-agent")
+            assert "memory/2026-03-02.md" in result
+            assert "memory/2026-03-01.md" in result
 
-        with patch("app.llm.LLMClient", return_value=mock_llm):
-            with patch.object(memory_service, "search_memory", mock_search):
-                with patch.object(memory_service, "create_entry", mock_create):
-                    count = await memory_service.flush_memory(
-                        messages=[{"role": "user", "content": "I really like Python programming"}],
-                        model_provider="anthropic",
-                        model_name="test-model",
-                    )
-                    assert count == 1
-                    mock_create.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_dedup_exact_match_keyword_mode(self, memory_db_session):
-        """In keyword-only mode (similarity=None), exact content match should dedup."""
-        from contextlib import asynccontextmanager
+class TestReadMemoryFile:
+    """Tests for read_memory_file()."""
 
-        @asynccontextmanager
-        async def mock_session():
-            yield memory_db_session
+    def test_read_existing_file(self, tmp_path: Path):
+        """Should read content of an existing memory file."""
+        agent_dir = tmp_path / "agents" / "test-agent"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "SOUL.md").write_text("soul content", encoding="utf-8")
 
-        # Mock LLM response that tries to save an existing entry
-        mock_response = MagicMock()
-        mock_block = MagicMock()
-        mock_block.text = '[{"content": "User likes Python", "category": "fact"}]'
-        mock_response.content = [mock_block]
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.read_memory_file("test-agent", "SOUL.md")
+            assert result == "soul content"
 
-        mock_llm = AsyncMock()
-        mock_llm.acreate = AsyncMock(return_value=mock_response)
+    def test_read_nonexistent_file(self, tmp_path: Path):
+        """Should return None for non-existent file."""
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.read_memory_file("test-agent", "SOUL.md")
+            assert result is None
 
-        with patch.object(memory_service.embedding_service, "aembed_single", new_callable=AsyncMock, return_value=None):
-            with patch.object(memory_service, "AsyncSessionLocal", mock_session):
-                # Pre-create the same entry
-                await memory_service.create_entry(content="User likes Python", category="fact")
+    def test_path_traversal_blocked(self, tmp_path: Path):
+        """Path traversal should return None."""
+        agent_dir = tmp_path / "agents" / "test-agent"
+        agent_dir.mkdir(parents=True)
 
-                with patch("app.llm.LLMClient", return_value=mock_llm):
-                    count = await memory_service.flush_memory(
-                        messages=[{"role": "user", "content": "I like Python"}],
-                    )
-                    # Should skip the duplicate
-                    assert count == 0
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.read_memory_file("test-agent", "../../etc/passwd")
+            assert result is None
 
-    @pytest.mark.asyncio
-    async def test_dedup_vector_mode(self, memory_db_session):
-        """In vector mode (similarity present), high similarity should dedup."""
-        from contextlib import asynccontextmanager
+    def test_read_with_line_range(self, tmp_path: Path):
+        """Should read specific line range from a file."""
+        agent_dir = tmp_path / "agents" / "test-agent"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "MEMORY.md").write_text("line1\nline2\nline3\nline4\nline5", encoding="utf-8")
 
-        @asynccontextmanager
-        async def mock_session():
-            yield memory_db_session
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.read_memory_file("test-agent", "MEMORY.md", from_line=2, lines=2)
+            assert result == "line2\nline3"
 
-        mock_response = MagicMock()
-        mock_block = MagicMock()
-        mock_block.text = '[{"content": "New fact", "category": "fact"}]'
-        mock_response.content = [mock_block]
+    def test_read_daily_log(self, tmp_path: Path):
+        """Should read a daily log file via memory/ path."""
+        agent_dir = tmp_path / "agents" / "test-agent"
+        memory_dir = agent_dir / "memory"
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "2026-03-02.md").write_text("today's notes", encoding="utf-8")
 
-        mock_llm = AsyncMock()
-        mock_llm.acreate = AsyncMock(return_value=mock_response)
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.read_memory_file("test-agent", "memory/2026-03-02.md")
+            assert result == "today's notes"
 
-        # Mock search_memory to return a high-similarity match
-        mock_search = AsyncMock(return_value=[
-            {"content": "Similar fact", "similarity": 0.98, "id": "existing-id"}
-        ])
 
-        with patch.object(memory_service.embedding_service, "aembed_single", new_callable=AsyncMock, return_value=None):
-            with patch.object(memory_service, "AsyncSessionLocal", mock_session):
-                with patch("app.llm.LLMClient", return_value=mock_llm):
-                    with patch.object(memory_service, "search_memory", mock_search):
-                        count = await memory_service.flush_memory(
-                            messages=[{"role": "user", "content": "test"}],
-                        )
-                        assert count == 0
+class TestLoadBootstrapFilesWithDailyLogs:
+    """Tests for load_bootstrap_files() daily log loading."""
 
-    @pytest.mark.asyncio
-    async def test_flush_max_10_entries(self):
-        """Flush should save at most 10 entries even if LLM returns more."""
-        import json as _json
+    def test_loads_todays_log(self, tmp_path: Path):
+        """Should include today's daily log when loading bootstrap files."""
+        from datetime import datetime as dt, timezone
+        agent_id = "test-agent-daily"
+        agent_dir = tmp_path / "agents" / agent_id
+        memory_dir = agent_dir / "memory"
+        memory_dir.mkdir(parents=True)
+        today = dt.now(timezone.utc).strftime("%Y-%m-%d")
+        (memory_dir / f"{today}.md").write_text("today's progress", encoding="utf-8")
 
-        # LLM returns 15 entries
-        entries = [{"content": f"Fact {i}", "category": "fact"} for i in range(15)]
-        mock_response = MagicMock()
-        mock_block = MagicMock()
-        mock_block.text = _json.dumps(entries)
-        mock_response.content = [mock_block]
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.load_bootstrap_files(agent_id)
+            assert f"memory/{today}.md" in result
+            assert result[f"memory/{today}.md"] == "today's progress"
 
-        mock_llm = AsyncMock()
-        mock_llm.acreate = AsyncMock(return_value=mock_response)
+    def test_loads_yesterdays_log(self, tmp_path: Path):
+        """Should include yesterday's daily log when loading bootstrap files."""
+        from datetime import datetime as dt, timedelta as td, timezone
+        agent_id = "test-agent-daily"
+        agent_dir = tmp_path / "agents" / agent_id
+        memory_dir = agent_dir / "memory"
+        memory_dir.mkdir(parents=True)
+        yesterday = (dt.now(timezone.utc) - td(days=1)).strftime("%Y-%m-%d")
+        (memory_dir / f"{yesterday}.md").write_text("yesterday's progress", encoding="utf-8")
 
-        mock_create = AsyncMock(return_value={"id": "new-id", "content": "x"})
-        mock_search = AsyncMock(return_value=[])
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.load_bootstrap_files(agent_id)
+            assert f"memory/{yesterday}.md" in result
 
-        with patch("app.llm.LLMClient", return_value=mock_llm):
-            with patch.object(memory_service, "search_memory", mock_search):
-                with patch.object(memory_service, "create_entry", mock_create):
-                    count = await memory_service.flush_memory(
-                        messages=[{"role": "user", "content": "lots of facts"}],
-                    )
-                    assert count == 10
-                    assert mock_create.call_count == 10
+    def test_no_daily_logs_without_agent_id(self, tmp_path: Path):
+        """Without agent_id, no daily logs should be loaded."""
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.load_bootstrap_files(agent_id=None)
+            # No memory/ keys
+            assert not any(k.startswith("memory/") for k in result)
 
-    @pytest.mark.asyncio
-    async def test_flush_invalid_json_returns_zero(self):
-        """Flush with LLM returning invalid JSON should return 0."""
-        mock_response = MagicMock()
-        mock_block = MagicMock()
-        mock_block.text = "This is not JSON at all"
-        mock_response.content = [mock_block]
+    def test_daily_logs_respect_total_limit(self, tmp_path: Path):
+        """Daily logs should not exceed total char limit."""
+        from datetime import datetime as dt, timezone
+        agent_id = "test-agent-limit"
+        agent_dir = tmp_path / "agents" / agent_id
 
-        mock_llm = AsyncMock()
-        mock_llm.acreate = AsyncMock(return_value=mock_response)
+        # Fill up with large bootstrap files first
+        for f in memory_service.BOOTSTRAP_FILES:
+            (agent_dir).mkdir(parents=True, exist_ok=True)
+            (agent_dir / f).write_text("x" * memory_service.PER_FILE_CHAR_LIMIT, encoding="utf-8")
 
-        with patch("app.llm.LLMClient", return_value=mock_llm):
-            count = await memory_service.flush_memory(
-                messages=[{"role": "user", "content": "test"}],
-            )
-            assert count == 0
+        memory_dir = agent_dir / "memory"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        today = dt.now(timezone.utc).strftime("%Y-%m-%d")
+        (memory_dir / f"{today}.md").write_text("y" * 10000, encoding="utf-8")
 
-    @pytest.mark.asyncio
-    async def test_flush_code_fenced_json(self):
-        """Flush should handle JSON wrapped in markdown code fences."""
-        mock_response = MagicMock()
-        mock_block = MagicMock()
-        mock_block.text = '```json\n[{"content": "Fenced fact", "category": "fact"}]\n```'
-        mock_response.content = [mock_block]
-
-        mock_llm = AsyncMock()
-        mock_llm.acreate = AsyncMock(return_value=mock_response)
-
-        mock_create = AsyncMock(return_value={"id": "new-id", "content": "Fenced fact"})
-        mock_search = AsyncMock(return_value=[])
-
-        with patch("app.llm.LLMClient", return_value=mock_llm):
-            with patch.object(memory_service, "search_memory", mock_search):
-                with patch.object(memory_service, "create_entry", mock_create):
-                    count = await memory_service.flush_memory(
-                        messages=[{"role": "user", "content": "test"}],
-                    )
-                    assert count == 1
-                    mock_create.assert_called_once()
+        with patch.object(memory_service, "_memory_dir", return_value=tmp_path):
+            result = memory_service.load_bootstrap_files(agent_id)
+            total = sum(len(v) for v in result.values())
+            assert total <= memory_service.TOTAL_CHAR_LIMIT
 
 
 # ─── Save Memory Sync Tests ─────────────────────────────────

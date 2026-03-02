@@ -1613,12 +1613,34 @@ MEMORY_TOOLS = [
             "required": ["content"]
         }
     },
+    {
+        "name": "memory_get",
+        "description": "Read content from a memory file (SOUL.md, USER.md, MEMORY.md, or memory/*.md daily logs). Use after memory_search to pull specific sections or review your own memory files.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative path within memory directory (e.g. 'SOUL.md' or 'memory/2026-03-02.md')"
+                },
+                "from_line": {
+                    "type": "integer",
+                    "description": "Starting line number (1-indexed, optional)"
+                },
+                "lines": {
+                    "type": "integer",
+                    "description": "Number of lines to read (optional, default: all)"
+                }
+            },
+            "required": ["path"]
+        }
+    },
 ]
 
 
 def create_memory_tool_functions(agent_id: Optional[str] = None) -> Dict[str, Callable]:
     """Create bound memory tool functions for a specific agent."""
-    from app.services.memory_service import search_memory_sync, save_memory_sync
+    from app.services.memory_service import search_memory_sync, save_memory_sync, read_memory_file
 
     def memory_search(query: str, top_k: int = 5, **kwargs) -> Dict[str, Any]:
         results = search_memory_sync(query, agent_id=agent_id, top_k=top_k)
@@ -1640,9 +1662,20 @@ def create_memory_tool_functions(agent_id: Optional[str] = None) -> Dict[str, Ca
         )
         return {"saved": True, "id": entry["id"], "content": content, "category": category}
 
+    def memory_get(path: str, from_line: int = 1, lines: int = 0, **kwargs) -> Dict[str, Any]:
+        if not agent_id:
+            return {"error": "No agent_id configured for memory access"}
+        from_line = int(from_line)
+        lines = int(lines)
+        content = read_memory_file(agent_id, path, from_line, lines)
+        if content is None:
+            return {"error": f"File not found: {path}"}
+        return {"path": path, "content": content}
+
     return {
         "memory_search": memory_search,
         "memory_save": memory_save,
+        "memory_get": memory_get,
     }
 
 
@@ -1751,6 +1784,7 @@ TOOL_REQUIRED_PARAMS: Dict[str, List[str]] = {
     "ask_user": ["question"],
     "memory_search": ["query"],
     "memory_save": ["content"],
+    "memory_get": ["path"],
 }
 
 

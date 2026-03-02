@@ -17,11 +17,16 @@ Supports multiple LLM providers:
 import asyncio
 import copy
 import json
+import logging
 import os
+import re
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Generator, List, Optional, TYPE_CHECKING
+from pathlib import Path
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, TYPE_CHECKING
 from dataclasses import dataclass, field, asdict
+
+logger = logging.getLogger(__name__)
 
 from app.config import settings
 from app.agent.tools import TOOLS, call_tool, acall_tool, get_tools_for_agent, BASE_TOOLS, META_TOOLS, get_mcp_client, _SKILLS_DIR
@@ -37,6 +42,35 @@ COMPRESSION_THRESHOLD_RATIO = 0.7  # Trigger compression when input tokens excee
 MAX_RECENT_TURNS = 5               # Keep at most 5 recent logical turns
 RECENT_TURNS_TOKEN_BUDGET = 0.25   # Recent turns can use up to 25% of context limit
 CHARS_PER_TOKEN = 3.5              # Conservative estimate for mixed CJK/English text
+
+# Memory flush constants (silent turn before context compression)
+MEMORY_FLUSH_MAX_TURNS = 3
+
+MEMORY_FLUSH_SYSTEM_PROMPT = (
+    "Pre-compaction memory flush turn. "
+    "The session is near auto-compaction; capture durable memories to disk. "
+    "You may reply, but usually NO_REPLY is correct."
+)
+
+MEMORY_FLUSH_USER_PROMPT = (
+    "Pre-compaction memory flush. "
+    "Store durable memories now:\n"
+    "- SOUL.md for persona, tone, and behavior instructions\n"
+    "- USER.md for user preferences, habits, and background\n"
+    "- MEMORY.md for curated long-term facts worth remembering\n"
+    "- memory/{date}.md for session-specific progress and decisions\n"
+    "Create memory/ directory if needed. "
+    "IMPORTANT: If a file already exists, READ it first, then WRITE with new content appended — "
+    "do not overwrite existing entries. "
+    "If nothing to store, reply with NO_REPLY.\n\n"
+    "Existing files:\n{existing_files}\n\n"
+    "Current time: {current_time}"
+)
+
+
+def _is_silent_reply(text: str) -> bool:
+    """Check if text is an exact NO_REPLY response (whitespace-tolerant)."""
+    return bool(re.match(r"^\s*NO_REPLY\s*$", text))
 
 
 SUMMARY_SYSTEM_PROMPT = """You have been given a partial transcript of a conversation between a user and an AI assistant. Write a summary that provides continuity so the assistant can continue making progress in a future context where the raw history is replaced by this summary.
@@ -636,6 +670,7 @@ class SkillsAgent:
         self.executor_name = executor_name  # Remote executor for code execution
         self.agent_id = agent_id  # Agent preset ID for memory scope
         self._background_tasks: set = set()  # prevent GC of fire-and-forget tasks
+        self._flush_tasks: set = set()  # prevent GC of memory flush tasks
 
         # Initialize LLM client with provider-specific configuration
         self.client = LLMClient(
@@ -713,8 +748,30 @@ class SkillsAgent:
             if not files:
                 return ""
             parts = ["\n\n## Agent Memory"]
+
+            # SOUL.md persona instruction (before file contents)
+            if "SOUL.md" in files:
+                parts.append(
+                    "\nIf SOUL.md is present, embody its persona and tone. "
+                    "Avoid stiff, generic replies; follow its guidance unless "
+                    "higher-priority instructions override it."
+                )
+
             for filename, content in files.items():
                 parts.append(f"\n### {filename}\n{content}")
+
+            # Memory Recall directive (when memory tools are available)
+            if self.agent_id:
+                parts.append(
+                    "\n### Memory Recall"
+                    "\nBefore answering anything about prior work, decisions, dates, "
+                    "people, preferences, or todos: run memory_search on MEMORY.md + "
+                    "memory/*.md; then use memory_get to pull only the needed lines. "
+                    "If low confidence after search, say you checked."
+                    "\nCitations: include Source: <path#line> when it helps the user "
+                    "verify memory snippets."
+                )
+
             return "\n".join(parts)
         except Exception as e:
             if self.verbose:
@@ -766,6 +823,161 @@ class SkillsAgent:
                 lines.append("")
 
         return "\n".join(lines)
+
+    def _create_flush_tools(self) -> Tuple[List[Dict], Dict[str, Callable]]:
+        """Create flush tools: only read + write, scoped to the agent's memory directory."""
+        from app.services.memory_service import _memory_dir
+        memory_base = _memory_dir() / "agents" / self.agent_id
+
+        def flush_read(file_path: str, **kwargs):
+            resolved = (memory_base / file_path).resolve()
+            if not resolved.is_relative_to(memory_base.resolve()):
+                return json.dumps({"error": "Access denied: path outside memory directory"})
+            if not resolved.exists():
+                return json.dumps({"error": f"File not found: {file_path}"})
+            return json.dumps({"content": resolved.read_text(encoding="utf-8")})
+
+        def flush_write(file_path: str, content: str, **kwargs):
+            resolved = (memory_base / file_path).resolve()
+            if not resolved.is_relative_to(memory_base.resolve()):
+                return json.dumps({"error": "Access denied: path outside memory directory"})
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(content, encoding="utf-8")
+            return json.dumps({"success": True, "path": file_path})
+
+        # Dedicated schemas describing memory-scoped relative paths
+        flush_tool_schemas = [
+            {
+                "name": "read",
+                "description": "Read a memory file by relative path within the agent's memory directory.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Relative path within memory directory (e.g. 'SOUL.md', 'memory/2026-03-02.md')",
+                        },
+                    },
+                    "required": ["file_path"],
+                },
+            },
+            {
+                "name": "write",
+                "description": "Write content to a memory file. Creates the file and parent directories if needed.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Relative path within memory directory (e.g. 'SOUL.md', 'USER.md', 'memory/2026-03-02.md')",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Content to write to the file",
+                        },
+                    },
+                    "required": ["file_path", "content"],
+                },
+            },
+        ]
+        flush_tool_functions = {"read": flush_read, "write": flush_write}
+        return flush_tool_schemas, flush_tool_functions
+
+    async def _run_memory_flush_turn(self, messages: List[Dict]) -> None:
+        """Fire-and-forget silent agent turn to persist durable memories.
+
+        Following OpenClaw's pattern: runs concurrently with compression.
+        The flush gets its own shallow copy of messages so it's safe.
+        """
+        try:
+            await self._run_memory_flush_turn_inner(messages)
+        except Exception as e:
+            logger.error(f"[Memory Flush] Failed (non-fatal): {e}", exc_info=True)
+
+    async def _run_memory_flush_turn_inner(self, messages: List[Dict]) -> None:
+        """Inner implementation of the memory flush turn."""
+        from app.services.memory_service import list_memory_files
+
+        logger.info(f"[Memory Flush] Starting for agent {self.agent_id}")
+
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        current_date = now.strftime("%Y-%m-%d")
+        current_time = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+        existing_files = list_memory_files(self.agent_id)
+
+        flush_user_msg = MEMORY_FLUSH_USER_PROMPT.format(
+            date=current_date,
+            current_time=current_time,
+            existing_files=existing_files,
+        )
+
+        # messages is already sliced at the call site (messages[-20:])
+        flush_messages = list(messages) + [{"role": "user", "content": flush_user_msg}]
+
+        # Agent's full system prompt + flush system prompt
+        flush_system = self.system_prompt + "\n\n" + MEMORY_FLUSH_SYSTEM_PROMPT
+
+        flush_tools, flush_tool_functions = self._create_flush_tools()
+
+        for turn in range(MEMORY_FLUSH_MAX_TURNS):
+            response = await self.client.acreate(
+                messages=flush_messages,
+                system=flush_system,
+                tools=flush_tools,
+                max_tokens=4096,
+            )
+
+            # Check for text-only NO_REPLY response
+            has_tool_calls = any(isinstance(b, LLMToolCall) for b in response.content)
+            if not has_tool_calls:
+                text_content = response.text_content or ""
+                if _is_silent_reply(text_content):
+                    logger.info("[Memory Flush] NO_REPLY — nothing to store")
+                    return
+                # Text-only but not NO_REPLY — agent is done talking
+                logger.info(f"[Memory Flush] Completed with text response (turn {turn + 1})")
+                return
+
+            # Process tool calls
+            assistant_content = []
+            tool_results = []
+
+            for block in response.content:
+                if isinstance(block, LLMTextBlock):
+                    assistant_content.append({"type": "text", "text": block.text})
+                elif isinstance(block, LLMToolCall):
+                    tool_input = block.input if block.input else {}
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": tool_input,
+                    })
+
+                    # Execute directly — flush tools are trivial sync I/O
+                    try:
+                        func = flush_tool_functions.get(block.name)
+                        if func:
+                            result = func(**tool_input)
+                        else:
+                            result = json.dumps({"error": f"Unknown tool: {block.name}"})
+                    except Exception as tool_err:
+                        result = json.dumps({"error": str(tool_err)})
+
+                    logger.info(f"[Memory Flush] Tool: {block.name}({json.dumps(tool_input, ensure_ascii=False)[:200]}) -> {str(result)[:200]}")
+
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+
+            flush_messages.append({"role": "assistant", "content": assistant_content})
+            flush_messages.append({"role": "user", "content": tool_results})
+
+        if self.verbose:
+            print(f"[Memory Flush] Completed after {MEMORY_FLUSH_MAX_TURNS} turns")
 
     def _get_context_limit(self) -> int:
         """Get the context window limit for the current model."""
@@ -1138,27 +1350,12 @@ class SkillsAgent:
 
             # Context compression check
             if last_input_tokens > 0 and self._should_compress(last_input_tokens):
-                # Flush memory before compression (fire-and-forget on a deep-copied snapshot,
-                # so compression can safely mutate/replace `messages` concurrently)
+                # Fire-and-forget memory flush (OpenClaw pattern) — snapshot messages
+                # at call site before compression can mutate the original list.
                 if self.agent_id:
-                    try:
-                        from app.services.memory_service import flush_memory
-                        snapshot = copy.deepcopy(messages[-20:])
-                        task = asyncio.create_task(flush_memory(
-                            snapshot, self.agent_id,
-                            self.model_provider, self.model,
-                        ))
-                        self._background_tasks.add(task)
-                        def _on_flush_done(t, _tasks=self._background_tasks):
-                            _tasks.discard(t)
-                            if not t.cancelled():
-                                exc = t.exception()
-                                if exc and self.verbose:
-                                    print(f"\n[Memory Flush] Background error: {exc}")
-                        task.add_done_callback(_on_flush_done)
-                    except Exception as flush_err:
-                        if self.verbose:
-                            print(f"\n[Memory Flush] Failed (non-fatal): {flush_err}")
+                    task = asyncio.create_task(self._run_memory_flush_turn(list(messages[-20:])))
+                    self._flush_tasks.add(task)
+                    task.add_done_callback(self._flush_tasks.discard)
                 if self.verbose:
                     print(f"\n[Context Compression] Input tokens ({last_input_tokens}) exceeded threshold, compressing...")
                 messages, s_in, s_out = await self._compress_messages(messages)

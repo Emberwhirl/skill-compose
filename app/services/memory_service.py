@@ -4,14 +4,15 @@ Provides:
 - Bootstrap file CRUD (SOUL.md, USER.md, MEMORY.md) with global/per-agent scopes
 - Memory entry CRUD with automatic embedding generation
 - Semantic search via pgvector cosine distance
-- Memory flush (LLM extraction of key facts from conversation)
+- Daily memory log loading (today + yesterday)
+- File-based memory helpers for the silent flush turn
 """
 
 import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,19 +30,6 @@ PER_FILE_CHAR_LIMIT = 20_000
 TOTAL_CHAR_LIMIT = 60_000
 HEAD_RATIO = 0.70
 TAIL_RATIO = 0.20
-
-# Flush prompt
-FLUSH_PROMPT = """You are a memory extraction assistant. Analyze the following conversation messages and extract key facts, preferences, procedures, and context that would be useful for future conversations.
-
-Return a JSON array of objects, each with:
-- "content": the fact/preference/procedure (1-3 sentences)
-- "category": one of "fact", "preference", "procedure", "context"
-
-Only extract genuinely useful, non-obvious information. Skip trivial details.
-Return ONLY the JSON array, no other text.
-
-Messages:
-{messages}"""
 
 
 # ─── Bootstrap File Operations ─────────────────────────────────
@@ -155,13 +143,13 @@ def delete_bootstrap_file(scope: str, filename: str) -> bool:
         return False
 
 
-def _truncate_content(content: str, limit: int) -> str:
-    """Truncate content keeping head + tail with a marker."""
+def _truncate_content(content: str, limit: int, filename: str = "file") -> str:
+    """Truncate content keeping head + tail with a marker including filename and char counts."""
     if len(content) <= limit:
         return content
     head_len = int(limit * HEAD_RATIO)
     tail_len = int(limit * TAIL_RATIO)
-    marker = "\n\n... [content truncated] ...\n\n"
+    marker = f"\n…(truncated {filename}: kept {head_len}+{tail_len} of {len(content)} chars)…\n"
     return content[:head_len] + marker + content[-tail_len:]
 
 
@@ -198,18 +186,80 @@ def load_bootstrap_files(agent_id: Optional[str] = None) -> Dict[str, str]:
 
         if content:
             # Per-file limit
-            content = _truncate_content(content, PER_FILE_CHAR_LIMIT)
+            content = _truncate_content(content, PER_FILE_CHAR_LIMIT, filename)
             # Total limit check
             if total_chars + len(content) > TOTAL_CHAR_LIMIT:
                 remaining = TOTAL_CHAR_LIMIT - total_chars
                 if remaining > 0:
-                    content = _truncate_content(content, remaining)
+                    content = _truncate_content(content, remaining, filename)
                 else:
                     break
             result[filename] = content
             total_chars += len(content)
 
+    # Load recent daily memory logs (today + yesterday)
+    if agent_id:
+        memory_log_dir = base / "agents" / agent_id / "memory"
+        if memory_log_dir.exists():
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+            for date_str in [yesterday, today]:
+                log_path = memory_log_dir / f"{date_str}.md"
+                if log_path.exists():
+                    try:
+                        content = log_path.read_text(encoding="utf-8")
+                    except Exception:
+                        continue
+                    log_filename = f"memory/{date_str}.md"
+                    content = _truncate_content(content, PER_FILE_CHAR_LIMIT, log_filename)
+                    if total_chars + len(content) <= TOTAL_CHAR_LIMIT:
+                        result[log_filename] = content
+                        total_chars += len(content)
+
     return result
+
+
+def list_memory_files(agent_id: str) -> str:
+    """List existing memory files for use in flush prompt context."""
+    base = _memory_dir() / "agents" / agent_id
+    lines = []
+    for f in BOOTSTRAP_FILES:
+        path = base / f
+        try:
+            lines.append(f"- {f} ({path.stat().st_size} bytes)")
+        except OSError:
+            pass
+    memory_dir = base / "memory"
+    if memory_dir.exists():
+        for f in sorted(memory_dir.glob("*.md"), reverse=True)[:5]:
+            try:
+                lines.append(f"- memory/{f.name} ({f.stat().st_size} bytes)")
+            except OSError:
+                pass
+    return "\n".join(lines) if lines else "(no files yet)"
+
+
+def read_memory_file(agent_id: str, rel_path: str, from_line: int = 1, lines: int = 0) -> Optional[str]:
+    """Read a memory file by relative path, with optional line range.
+
+    Returns None if path traversal is detected or file doesn't exist.
+    """
+    base = _memory_dir() / "agents" / agent_id
+    resolved = (base / rel_path).resolve()
+    if not resolved.is_relative_to(base.resolve()):
+        return None  # Path traversal attempt
+    if not resolved.exists():
+        return None
+    try:
+        text_content = resolved.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    if from_line > 1 or lines > 0:
+        all_lines = text_content.splitlines()
+        start = max(0, from_line - 1)
+        end = start + lines if lines > 0 else len(all_lines)
+        return "\n".join(all_lines[start:end])
+    return text_content
 
 
 # ─── Memory Entry Operations (DB + Vector) ──────────────────────
@@ -563,105 +613,3 @@ def save_memory_sync(
     }
 
 
-# ─── Memory Flush (pre-compression extraction) ──────────────────
-
-async def flush_memory(
-    messages: List[Dict],
-    agent_id: Optional[str] = None,
-    model_provider: Optional[str] = None,
-    model_name: Optional[str] = None,
-) -> int:
-    """Extract key facts from recent messages and save as memory entries.
-
-    Called before context compression to preserve important information.
-    Returns the number of entries saved.
-    """
-    # Serialize messages for the prompt (caller may already pass a slice)
-    serialized = []
-    for msg in messages:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            text_parts = []
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif block.get("type") == "tool_use":
-                        text_parts.append(f"[tool: {block.get('name', '')}]")
-                    elif block.get("type") == "tool_result":
-                        result_content = block.get("content", "")
-                        if isinstance(result_content, str):
-                            text_parts.append(f"[result: {result_content[:200]}]")
-                elif isinstance(block, str):
-                    text_parts.append(block)
-            content = "\n".join(text_parts)
-        if content:
-            serialized.append(f"[{role}]: {content[:500]}")
-
-    if not serialized:
-        return 0
-
-    messages_text = "\n".join(serialized)
-    prompt = FLUSH_PROMPT.replace("{messages}", messages_text)
-
-    try:
-        from app.llm import LLMClient
-        client = LLMClient(
-            provider=model_provider or get_settings().default_model_provider,
-            model=model_name or get_settings().default_model_name,
-        )
-        response = await client.acreate(
-            messages=[{"role": "user", "content": prompt}],
-            system="You extract structured memory entries from conversations.",
-            max_tokens=2000,
-        )
-
-        # Parse the response
-        response_text = ""
-        for block in response.content:
-            if hasattr(block, 'text'):
-                response_text += block.text
-
-        # Try to parse JSON array
-        response_text = response_text.strip()
-        if response_text.startswith("```"):
-            # Strip markdown code fence
-            lines = response_text.split("\n")
-            response_text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-
-        entries = json.loads(response_text)
-        if not isinstance(entries, list):
-            return 0
-
-        saved = 0
-        for entry in entries[:10]:  # Max 10 entries per flush
-            if not isinstance(entry, dict) or "content" not in entry:
-                continue
-            content = entry["content"]
-            # Dedup: skip if a very similar entry already exists
-            try:
-                existing = await search_memory(content, agent_id=agent_id, top_k=1)
-                if existing:
-                    sim = existing[0].get("similarity")
-                    if sim is not None and sim > 0.95:
-                        continue
-                    # Keyword-only mode: similarity is None, fall back to exact match
-                    if sim is None and existing[0].get("content", "").strip() == content.strip():
-                        continue
-            except Exception:
-                pass  # search failure should not block saving
-            await create_entry(
-                content=content,
-                agent_id=agent_id,
-                category=entry.get("category", "context"),
-                source="auto_flush",
-            )
-            saved += 1
-
-        logger.info(f"Memory flush: saved {saved} entries for agent {agent_id}")
-        return saved
-
-    except Exception as e:
-        logger.warning(f"Memory flush failed (non-fatal): {e}")
-        return 0
