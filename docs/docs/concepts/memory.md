@@ -17,8 +17,6 @@ Agent memory gives agents the ability to remember information across sessions. W
                     │  │ SOUL.md       │  │  ← persona, tone
                     │  │ USER.md       │  │  ← user preferences
                     │  │ MEMORY.md     │  │  ← curated facts
-                    │  │               │  │     (daily logs accessed
-                    │  │               │  │      via memory_get tool)
                     │  └───────────────┘  │
                     │  ### Memory Recall  │  ← search directive
                     └────────────────────┘
@@ -40,18 +38,20 @@ Agent memory gives agents the ability to remember information across sessions. W
               └───────────────┴───────────────┘
 ```
 
+Daily logs (`memory/*.md`) are **not** in the system prompt — they are accessed on demand via the `memory_get` tool.
+
 ## File-Based Memory (Bootstrap Files)
 
 Bootstrap files are markdown files loaded into the system prompt at the start of every agent session. They provide persistent context that the agent always has access to.
 
 ### Files
 
-| File | Purpose | Example Content |
-|------|---------|-----------------|
-| `SOUL.md` | Agent persona, tone, behavior | "You are a senior staff engineer. Be direct and concise." |
-| `USER.md` | User preferences and habits | "User prefers dark mode, Python, and code over prose." |
-| `MEMORY.md` | Curated long-term facts | "Project migrated from REST to gRPC on March 10." |
-| `memory/YYYY-MM-DD.md` | Daily session logs | Progress notes, decisions, TODOs from each day |
+| File | Injected into Prompt | Purpose | Example Content |
+|------|---------------------|---------|-----------------|
+| `SOUL.md` | Yes | Agent persona, tone, behavior | "You are a senior staff engineer. Be direct and concise." |
+| `USER.md` | Yes | User preferences and habits | "User prefers dark mode, Python, and code over prose." |
+| `MEMORY.md` | Yes | Curated long-term facts | "Project migrated from REST to gRPC on March 10." |
+| `memory/YYYY-MM-DD.md` | **No** | Daily session logs | Progress notes, decisions, TODOs from each day |
 
 ### Directory Structure
 
@@ -73,18 +73,20 @@ memory/
 
 **Override logic:** Per-agent files take precedence over global files of the same name. If an agent has its own `SOUL.md`, the global `SOUL.md` is ignored for that agent.
 
+**Processing order:** Files are loaded in `SOUL.md → USER.md → MEMORY.md` order. If the total character limit is reached, later files may be truncated further or skipped entirely.
+
 ### Truncation
 
-Large files are truncated to prevent system prompt bloat:
+Bootstrap files injected into the system prompt are truncated to prevent bloat:
 
 | Limit | Value |
 |-------|-------|
 | Per-file limit | 20,000 chars |
-| Total limit (all files) | 60,000 chars |
+| Total limit (all bootstrap files) | 60,000 chars |
 | Head ratio | 70% (kept from start) |
 | Tail ratio | 20% (kept from end) |
 
-When a file exceeds its limit, it's split into head + truncation marker + tail:
+When a file exceeds its per-file limit, it's split into head + truncation marker + tail:
 
 ```
 [first 70% of content]
@@ -92,9 +94,15 @@ When a file exceeds its limit, it's split into head + truncation marker + tail:
 [last 20% of content]
 ```
 
+If adding a file would exceed the total limit, it's further truncated to fit the remaining space. If no space remains, the file is skipped.
+
+**Note:** Truncation only applies to bootstrap injection. When reading files via the `memory_get` tool, full content is returned without truncation — callers use `from_line`/`lines` for partial reads if needed.
+
 ### Daily Logs
 
 Daily log files (`memory/YYYY-MM-DD.md`) are **not** injected into the system prompt. They remain on disk and are accessible at runtime via the `memory_get` tool. This matches OpenClaw's approach — only `SOUL.md`, `USER.md`, and `MEMORY.md` are loaded into the prompt.
+
+Agents are instructed (via the Memory Recall directive) to use `memory_get` to read daily logs on demand.
 
 ## System Prompt Injection
 
@@ -141,7 +149,7 @@ The flush fires when context compression is needed — i.e., when input tokens e
 ### How It Works
 
 ```
-1. Compression threshold reached
+1. Compression threshold reached (input tokens > 70% of context limit)
 2. Snapshot last 20 messages at call site
 3. asyncio.create_task() → fire-and-forget
 4. Compression proceeds concurrently
@@ -204,7 +212,7 @@ For structured, searchable memory, entries are stored in PostgreSQL with pgvecto
 | `agent_id` | UUID (nullable) | `NULL` = global memory |
 | `content` | TEXT | Memory text (max 4096 chars) |
 | `category` | VARCHAR | `fact`, `preference`, `procedure`, `context`, `session_summary` |
-| `source` | VARCHAR | `manual`, `auto_flush`, `agent_tool`, `session_end` |
+| `source` | VARCHAR | `manual` (API), `agent_tool` (runtime tool), `auto_flush`, `session_end` |
 | `embedding` | vector(1536) | pgvector embedding for semantic search |
 | `embedding_model` | VARCHAR | e.g. `text-embedding-3-small` |
 | `session_id` | UUID (nullable) | Optional session association |
@@ -239,6 +247,11 @@ Search memory entries by semantic similarity.
 }
 ```
 
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `query` | string | Yes | — | Search query |
+| `top_k` | integer | No | 5 | Max results to return |
+
 Returns matching entries with similarity scores.
 
 ### memory_save
@@ -252,11 +265,16 @@ Save new information to long-term memory.
 }
 ```
 
-Categories: `fact`, `preference`, `procedure`, `context`.
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `content` | string | Yes | — | Information to save (max 4096 chars, truncated if longer) |
+| `category` | enum | No | `"context"` | One of: `fact`, `preference`, `procedure`, `context` |
+
+Entries are saved with `source: "agent_tool"`.
 
 ### memory_get
 
-Read a memory file by relative path, optionally with line range.
+Read a memory file by relative path. Returns full content without truncation.
 
 ```json
 {
@@ -266,7 +284,13 @@ Read a memory file by relative path, optionally with line range.
 }
 ```
 
-Returns file content or error if not found.
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `path` | string | Yes | — | Relative path (e.g. `SOUL.md`, `memory/2026-03-02.md`) |
+| `from_line` | integer | No | 1 | Starting line number (1-indexed) |
+| `lines` | integer | No | 0 (all) | Number of lines to read |
+
+This is the primary way to access daily logs, which are not included in the system prompt.
 
 ## API Endpoints
 
@@ -274,7 +298,7 @@ Returns file content or error if not found.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/memory/files?agent_id={id}` | List files with metadata |
+| `GET` | `/memory/files?agent_id={id}` | List files with metadata (global + per-agent) |
 | `GET` | `/memory/files/{scope}/{filename}` | Read file content |
 | `PUT` | `/memory/files/{scope}/{filename}` | Write file content |
 | `DELETE` | `/memory/files/{scope}/{filename}` | Delete file |
@@ -285,11 +309,11 @@ Returns file content or error if not found.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/memory/entries?agent_id={id}&category={cat}&limit=50` | List entries |
-| `POST` | `/memory/entries` | Create entry |
-| `PUT` | `/memory/entries/{entry_id}` | Update entry |
+| `GET` | `/memory/entries?agent_id={id}&category={cat}&limit=50&offset=0` | List entries (paginated) |
+| `POST` | `/memory/entries` | Create entry (auto-embeds) |
+| `PUT` | `/memory/entries/{entry_id}` | Update entry (re-embeds if content changed) |
 | `DELETE` | `/memory/entries/{entry_id}` | Delete entry |
-| `POST` | `/memory/search` | Semantic search |
+| `POST` | `/memory/search` | Semantic search (`top_k` default: 10, range: 1–100) |
 
 ## Frontend
 

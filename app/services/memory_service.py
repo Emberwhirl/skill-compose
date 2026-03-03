@@ -4,7 +4,7 @@ Provides:
 - Bootstrap file CRUD (SOUL.md, USER.md, MEMORY.md) with global/per-agent scopes
 - Memory entry CRUD with automatic embedding generation
 - Semantic search via pgvector cosine distance
-- Daily memory log loading (today + yesterday)
+- Daily memory log access via read_memory_file() (on-demand, not injected)
 - File-based memory helpers for the silent flush turn
 """
 
